@@ -69,4 +69,4 @@ This project is licensed under the [MIT License](./LICENSE).
 TBD
 
 ## Contact
-TBD
+kr-mcn@kddi.com
