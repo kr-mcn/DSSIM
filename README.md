@@ -66,7 +66,17 @@ This project is licensed under the [MIT License](./LICENSE).
 
 
 ## Citation
-TBD
+@ARTICLE{11357890,
+  author={Suzuki, Akito and Itahara, Sohei and Ogawara, Takeo and Suzuki, Masaki},
+  journal={IEEE Access}, 
+  title={Multi-Generation DualSteer: Cross-Layer Traffic Control With Asymmetric RAN Feedback}, 
+  year={2026},
+  volume={14},
+  number={},
+  pages={12594-12604},
+  keywords={6G mobile communication;Cross layer design;Throughput;Protocols;Downlink;Costs;5G mobile communication;Computer architecture;3GPP;Packet loss;Cellular network;mobile core;multi-access aggregation;DualSteer;cross-layer control;3GPP;6G network},
+  doi={10.1109/ACCESS.2026.3655089}}
+
 
 ## Contact
 kr-mcn@kddi.com
