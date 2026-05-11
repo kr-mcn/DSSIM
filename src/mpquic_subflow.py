@@ -2,15 +2,14 @@ import numpy as np
 from pathlib import Path
 import math
 from param import ParameterClass, TimeManager
-from packet import Sent_packets, get_time
+from packet import get_time, Sent_packets
 from cubic_hystart import CUBIC_HyStart
-
 import os
 import datetime
 import matplotlib.pyplot as plt
 import csv
-import pdb
-
+import pdb  # pdb.set_trace()
+from bbrv1 import BBRv1
 
 class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
     def __init__(self, logger, mpquic_instance=None):
@@ -28,6 +27,9 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
         if mode == "CUBIC":
             cc_instance = CUBIC_HyStart(
                 logger=self.logger, log_dir1="MPQUIC", log_dir2=f"UE{ue_id}/SF{subflow_id}")
+        elif mode == "BBR":
+            cc_instance = BBRv1(logger=self.logger,
+                                log_dir1="MPQUIC", log_dir2=f"UE{ue_id}/SF{subflow_id}")
         else:
             raise ValueError(f"Unsupported congestion control mode: {mode}")
         self.ue_states[ue_id] = {
@@ -64,6 +66,10 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
             'loss_epoch_end_num': 0,  # Packet number sent immediately after entering the epoch. Ends when this packet is ACKed.
             'counter_total_packet_loss': 0,
             'counter_total_sent_packets': 0,
+
+            ### BBR attributes added ###
+            'delivered_packets': 0,
+            ### end ###
         }
         for i in range(ParameterClass.NUM_UE):
             # Prevents missing logs for paths where no transmission/reception occurs (depends on logger behavior).
@@ -96,7 +102,11 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
         # Do not modify received_packets; just add seq_num for this layer
         for packet in received_data:
             packet[self.INDEX_OUTER_PACKET_ID] = state['seq_num']
+            enqueue_time = packet[self.INDEX_UPF_ENQUEUE_TIMESTAMP]
             packet[self.INDEX_UPF_TRANSMIT_TIMESTAMP] = TimeManager.time_index
+            if enqueue_time > 0:
+                upf_queuing_delay = TimeManager.time_index - enqueue_time
+                self.logger.store("UPF", f"UE{ue_id}", "upf_queuing_delay", str(int(upf_queuing_delay)))
             packets_to_send.append(packet)
             self.add_sent_packet(ue_id, packet_number=state['seq_num'], in_flight=True, sent_bits=self.MTU_BIT_SIZE,
                                  retransmission=False, inner_packet_number=packet[self.INDEX_PACKET_ID], stream_packet_number=packet[self.INDEX_STREAM_PACKET_ID])
@@ -131,6 +141,25 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
             if state['ack_counter'] != 0:
                 state['ack_delay'] = round(
                     state['ack_delay'] + self.TIME_SLOT_WINDOW, 6)  # Increment ack_delay
+                # max_ack_delay: force-send ACK if delay exceeds threshold
+                if state['ack_delay'] >= ParameterClass.MAX_ACK_DELAY:
+                    state['ack_counter'] = 0
+                    ack_packet = np.zeros(
+                        (1, ParameterClass.NUM_INFO_PACKET), dtype=int)
+                    ack_size = ParameterClass.IPV4_HEADER_SIZE + \
+                        ParameterClass.UDP_HEADER_SIZE + ParameterClass.ACK_PAYLOAD
+                    ack_packet[:, self.INDEX_OUTER_PACKET_ID] = state['seq_num_for_ack']
+                    ack_packet[:, self.INDEX_PAYLOAD_SIZE] = ack_size
+                    ack_packet[:, self.INDEX_ue_id] = ue_id
+                    ack_packet[:, self.INDEX_OUTER_ACK_FLAG] = 1
+                    state['ack_packet_dict'][state['seq_num_for_ack']] = [
+                        state['l4_max_received_seq_num']+1, state['missing_seq_nums'],
+                        self.mpquic.ue_states[ue_id]['fc_recv_max_offset']]
+                    state['seq_num_for_ack'] += 1
+                    state['ack_delay'] = 0
+                    self.logger.store(
+                        "MPQUIC", f"UE{ue_id}", f"SF{state['subflow_id']}_ue_send_ack", f"time_index={TimeManager.time_index}: UE sent ACK (max_ack_delay) = \n{ack_packet}")
+                    return ack_packet
             return
 
         self.logger.store(
@@ -183,7 +212,8 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
 
                 # Update the ACK master table, mapping packet ID to record
                 state['ack_packet_dict'][state['seq_num_for_ack']] = [
-                    state['l4_max_received_seq_num']+1, state['missing_seq_nums']]
+                    state['l4_max_received_seq_num']+1, state['missing_seq_nums'],
+                    self.mpquic.ue_states[ue_id]['fc_recv_max_offset']]
                 # Increment ACK sequence number for next ACK
                 state['seq_num_for_ack'] += 1
 
@@ -200,6 +230,27 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
         if packets_to_send.size == 0:  # Received packets but no ACK generated
             state['ack_delay'] = round(
                 state['ack_delay'] + ParameterClass.TIME_SLOT_WINDOW, 6)
+            # max_ack_delay: force-send ACK if delay exceeds threshold
+            if state['ack_delay'] >= ParameterClass.MAX_ACK_DELAY:
+                state['ack_counter'] = 0
+                ack_packet = np.zeros(
+                    (1, ParameterClass.NUM_INFO_PACKET), dtype=int)
+                ack_size = ParameterClass.IPV4_HEADER_SIZE + \
+                    ParameterClass.UDP_HEADER_SIZE + ParameterClass.ACK_PAYLOAD
+                ack_packet[:, self.INDEX_OUTER_PACKET_ID] = state['seq_num_for_ack']
+                ack_packet[:, self.INDEX_PAYLOAD_SIZE] = ack_size
+                ack_packet[:, self.INDEX_ue_id] = ue_id
+                ack_packet[:, self.INDEX_OUTER_ACK_FLAG] = 1
+                state['ack_packet_dict'][state['seq_num_for_ack']] = [
+                    state['l4_max_received_seq_num']+1, state['missing_seq_nums'],
+                    self.mpquic.ue_states[ue_id]['fc_recv_max_offset']]
+                state['seq_num_for_ack'] += 1
+                state['ack_delay'] = 0
+                packets_to_send = np.append(
+                    packets_to_send, ack_packet, axis=0)
+                self.logger.store(
+                    "MPQUIC", f"UE{ue_id}", f"SF{state['subflow_id']}_ue_send_ack", f"time_index={TimeManager.time_index}: UE sent ACK (max_ack_delay) = \n{packets_to_send}")
+                return packets_to_send
             return
         else:
             state['ack_delay'] = 0
@@ -215,13 +266,32 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
         """
         state = self.ue_states[ue_id]
         if ack_packets.size > 0:
-            # Process ACK packets one by one
+            # Process ACK pacets one by one
+            ### Cumulative ACKs for BBR - boundeling ACKs together ###
+            cumulative_newly_acked_packets = []
+            cumulative_lost_packets = 0
+            app_limited = False
+            ### end ###
+
+            ### BBR sets the previous inflight ###
+            if ParameterClass.MPQUIC_CC == "BBR":
+                # snapshot the amount that was in flight immediately before processing these ACKs
+                state['cc_algo'].previous_inflight = state['cc_algo'].inflight_packet_data.inflight()
+            ### end ###
+
             for ack_packet in ack_packets:
                 if ack_packet[self.INDEX_OUTER_PACKET_ID] in state['ack_packet_dict']:
                     # Retrieve corresponding record from the ACK master table
                     ack_entry = state['ack_packet_dict'].pop(
                         ack_packet[self.INDEX_OUTER_PACKET_ID])
-                    next_seq_num, missing_packets = ack_entry
+                    next_seq_num, missing_packets = ack_entry[0], ack_entry[1]
+
+                    # FC: Extract MAX_DATA notified from the UE and update fc_send_max_offset
+                    # MAX_DATA is only valid when monotonically increasing (RFC 9000: smaller values are ignored)
+                    if len(ack_entry) > 2 and ack_entry[2] is not None:
+                        mpquic_state = self.mpquic.ue_states[ue_id]
+                        mpquic_state['fc_send_max_offset'] = max(
+                            mpquic_state['fc_send_max_offset'], ack_entry[2])
 
                     # Update the largest ACKed packet number
                     state['largest_acked_packet_on_sender'] = max(
@@ -250,8 +320,19 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
                         del state['sent_packets'][packet_number]
 
                     lost_packets = self.detect_and_remove_lost_packets(ue_id)
+
+                    ### BBR initial variable for number of lost packets ###
+                    num_lost_packets = len(lost_packets)
+                    ### end ###
+
                     if lost_packets:
-                        self.on_packets_lost(ue_id, lost_packets)
+                        congestion_condition = self.on_packets_lost(ue_id, lost_packets)
+
+                        ### BBR triggers congestion event and transmits number of newely lost packets this ACK ###
+                        if ParameterClass.MPQUIC_CC == "BBR" and congestion_condition:
+                            state['cc_algo'].on_congestion_event()
+                            self.start_loss_epoch(ue_id)
+                        ### end ###
 
                     # App-limited check (conforms to Linux TCP Cubic behavior)
                     if ParameterClass.APP_LIMITED_OPTION == True:
@@ -271,11 +352,34 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
 
                     # Perform CUBIC control upon ACK reception
                     newly_acked_num = len(newly_acked_packets)
-                    state['cc_algo'].on_ack(segments_num_acked=newly_acked_num, rtt=state['latest_rtt'], smoothed_rtt=state['smoothed_rtt'],
-                                            seq_num_acked=state['largest_acked_packet_on_sender'], next_seq_num=state['seq_num']+1, app_limited=app_limited)
+
+                    ### Note: Calling on_ack() function of CCA ###
+                    ### BBR wants all ACKed sequence numbers, not just length ###
+                    if ParameterClass.MPQUIC_CC == "BBR":
+                        cumulative_newly_acked_packets.extend(newly_acked_packets)
+                        cumulative_lost_packets += num_lost_packets
+                    else:
+                        state['cc_algo'].on_ack(segments_num_acked=newly_acked_num, rtt=state['latest_rtt'], smoothed_rtt=state['smoothed_rtt'],
+                                                seq_num_acked=state['largest_acked_packet_on_sender'], next_seq_num=state['seq_num']+1, app_limited=app_limited)
+                    ### end ###
 
                     state['pto_count'] = 0
                     self.set_loss_detection_timer(ue_id)
+
+            ### Cumulative ACK for BBR - bundeling all ack messages in one sim cycle together ###
+            if ParameterClass.MPQUIC_CC == "BBR":
+                state['cc_algo'].on_ack(segments_num_acked=cumulative_newly_acked_packets, rtt=state['latest_rtt'], smoothed_rtt=state['smoothed_rtt'],
+                                        seq_num_acked=state['largest_acked_packet_on_sender'], next_seq_num=state['seq_num']+1, app_limited=app_limited, num_lost_packets=cumulative_lost_packets)
+
+                state['delivered_packets'] += len(cumulative_newly_acked_packets)
+                state['cc_algo'].delivered = state['delivered_packets']
+            ### end ###
+
+            ### BBR remove packet from internal packet manager after ACK ###
+            if ParameterClass.MPQUIC_CC == "BBR":
+                for packet_number in cumulative_newly_acked_packets:
+                        state['cc_algo'].inflight_packet_data.delete_packet(packet_number)
+            ### end ###
 
         # Update the number of transmittable packets for this subflow
         self.update_transmittable_packets_num(ue_id)
@@ -293,6 +397,7 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
         packet_number refers to the packet number space at the subflow layer (outer_id).
         The inner_packet_number is kept for retransmission handling.
         """
+        state = self.ue_states[ue_id]
         if ue_id not in self.ue_states:
             raise ValueError(f"UE ID '{ue_id}' has not been initialized.")
         sent_packets = self.ue_states[ue_id]['sent_packets']
@@ -302,6 +407,25 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
         packet.retransmission = retransmission
         packet.inner_packet_number = inner_packet_number
         packet.stream_packet_number = stream_packet_number
+
+        ### BBR packet management ###
+        # Only execute if CCA is BBR
+        state = self.ue_states[ue_id]
+        if ParameterClass.MPQUIC_CC == "BBR":
+
+            # Get all the important data before
+            bbr_packet_number = packet_number
+            bbr_packet_delivered = state['delivered_packets']
+            bbr_packet_send_time = round(TimeManager.time_index * ParameterClass.TIME_SLOT_WINDOW * 1000, 6) # in ms
+            bbr_packet_size = sent_bits
+            bbr_packet_is_inflight = in_flight
+            bbr_packet_is_app_limited = state['cc_algo'].app_limited
+            bbr_packet_is_retransmitted = retransmission
+
+            # Enter the information into the dict
+            state['cc_algo'].inflight_packet_data.add_packet(bbr_packet_number, bbr_packet_send_time, bbr_packet_delivered, bbr_packet_size,
+                                                            bbr_packet_is_inflight, bbr_packet_is_app_limited, bbr_packet_is_retransmitted, ue_id)
+        ### end ###
 
     def get_pto_time(self, ue_id):
         state = self.ue_states[ue_id]
@@ -379,8 +503,11 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
 
         state['loss_time'] = 0
         lost_packets = []
-        loss_delay = self.K_TIME_THRESH * \
-            max(state['latest_rtt'], state['smoothed_rtt'])
+
+        ### Debug: this expression seems to be different from QUIC stadnard ###
+        # Previously: loss_delay = self.K_TIME_THRESH * \ max(state['latest_rtt'], state['smoothed_rtt'])
+        loss_delay =  state['smoothed_rtt'] + max(4.0 * state['rtt_var'], 0.005) 
+        ### end ###
 
         loss_delay = max(loss_delay, self.K_GRANULARITY)
 
@@ -429,6 +556,11 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
         """
         state = self.ue_states[ue_id]
 
+        ### BBR triggeres timeout here ###
+        if ParameterClass.MPQUIC_CC == "BBR":
+            state['cc_algo'].on_timeout()
+        ### end ###
+
         earliest_loss_time = state['loss_time']
         if earliest_loss_time != 0:  # If the non-PTO timer expired
             lost_packets = self.detect_and_remove_lost_packets(ue_id)
@@ -449,8 +581,20 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
 
         for _ in range(self.PTO_TRANSMIT_NUM):
             state['transmittable_packets_num'] += 1
+
+        # PTO event log
+        inflight_count = sum(1 for p in state['sent_packets'].values() if p.in_flight)
+        next_pto = state['loss_detection_timer']
         self.logger.store(
-            "MPQUIC", f"UE{ue_id}", f"SF{state['subflow_id']}_transmittable_packets_num", f"time_index={TimeManager.time_index}: transmittable_packets_num (PTO) = {state['transmittable_packets_num']}")
+            "MPQUIC", f"UE{ue_id}", f"SF{state['subflow_id']}_pto_event",
+            f"time_index={TimeManager.time_index}\t"
+            f"pto_count={state['pto_count']}\t"
+            f"smoothed_rtt={state['smoothed_rtt']:.6f}[s]\t"
+            f"rtt_var={state['rtt_var']:.6f}[s]\t"
+            f"inflight_pkts={inflight_count}\t"
+            f"next_pto_timer={next_pto:.6f}[s]\t"
+            f"transmittable={state['transmittable_packets_num']}"
+        )
 
     def on_packets_lost(self, ue_id, lost_packets):
         state = self.ue_states[ue_id]
@@ -476,20 +620,28 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
             del state['sent_packets'][lost_seq_num]
 
         # Trigger a congestion event
-        if sent_time_of_last_loss != 0 and state['loss_epoch_flag'] == False:
-            state['cc_algo'].on_congestion_event()
-            self.start_loss_epoch(ue_id)
+            ### BBR deletes lost packets from internal dict ###
+            if ParameterClass.MPQUIC_CC == "BBR":
+                state['cc_algo'].inflight_packet_data.delete_packet(lost_seq_num)
+            ### end ###
 
-        # If you do not block retransmission for 1 RTT, here is the update process for the retransmission list
-        """
-        state['retransmission_seq_nums'].extend(lost_packets) # Add packets to the retransmission list
-        """
+        ### Guard for BBR since timeout and congestion are two distinct events ###
+        if ParameterClass.MPQUIC_CC != "BBR":
+            if sent_time_of_last_loss != 0 and state['loss_epoch_flag'] == False:
+                state['cc_algo'].on_congestion_event()
+                self.start_loss_epoch(ue_id)
 
         # For log.
         self.logger.store("MPQUIC", f"UE{ue_id}", f"SF{state['subflow_id']}_lost_packets",
-                          f"time_index={TimeManager.time_index}: Lost packet={lost_packets}")
+                          f"time_index={TimeManager.time_index}: Newly lost packet={lost_packets_for_del_from_inflight}")
         state['counter_total_packet_loss'] += len(
             lost_packets_for_del_from_inflight)
+        
+        if sent_time_of_last_loss != 0 and state['loss_epoch_flag'] == False:
+            return True
+        else:
+            return False
+        ### end ###
 
     def start_loss_epoch(self, ue_id):
         state = self.ue_states[ue_id]
@@ -503,6 +655,11 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
         state['loss_epoch_flag'] = False
         self.logger.store("MPQUIC", f"UE{ue_id}", f"SF{state['subflow_id']}_packet_loss_cause",
                           f"time={self.time_index}:\tloss_epoch ends.")
+        
+        ### End loss recovery inside of BBR ###
+        if ParameterClass.MPQUIC_CC == "BBR":
+            state['cc_algo'].exit_congestion_event()
+        ### end ###
 
     def log_for_debug(self, ue_id):
         state = self.ue_states[ue_id]
@@ -532,10 +689,13 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
         # Store into the sent packet data table
         self.add_sent_packet(ue_id, packet_number=state['seq_num'], in_flight=True, sent_bits=self.MTU_BIT_SIZE,
                              retransmission=True, inner_packet_number=packet[0][self.INDEX_PACKET_ID], stream_packet_number=packet[0][self.INDEX_STREAM_PACKET_ID])
+        # self.add_sent_packet(ue_id, packet_number=state['sent_packets'][lost_packet_id].inner_packet_number, in_flight=True, sent_bits=self.MTU_BIT_SIZE,
+        #                      retransmission=True, inner_packet_number=packet[0][self.INDEX_PACKET_ID], stream_packet_number=packet[0][self.INDEX_STREAM_PACKET_ID])
 
         # Enqueue into the MPQUIC layer's retransmission queue
         self.mpquic.ue_states[ue_id]['retranmission_buffer_to_lower_layer'].enqueue(
             packet)
+        self.mpquic.ue_states[ue_id]['retransmit_enqueue_count'] += 1
 
         # Update the number of transmittable packets referenced by the MPQUIC layer
         self.update_transmittable_packets_num(ue_id)
@@ -547,11 +707,12 @@ class MPQUIC_SUBFLOW(ParameterClass, TimeManager):
     def update_transmittable_packets_num(self, ue_id):
         state = self.ue_states[ue_id]
         cwnd = state['cc_algo'].cwnd
+        
         inflight_size = sum(
             1 for p in state['sent_packets'].values() if p.in_flight)
-        state['transmittable_packets_num'] = max(0, int(cwnd - inflight_size))
-        self.logger.store("MPQUIC", f"UE{ue_id}", f"SF{state['subflow_id']}_transmittable_packets_num",
-                          f"time_index={TimeManager.time_index}: transmittable_packets_num = {state['transmittable_packets_num']}")
+        
+        window = int(cwnd - inflight_size)
+        state['transmittable_packets_num'] = max(0, window)
 
     def onetime_logger(self, ue_id):
         state = self.ue_states[ue_id]

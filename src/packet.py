@@ -14,7 +14,7 @@ class Packet:
     in_flight: bool = False
     sent_bits: int = 0
     retransmission: bool = False
-    inner_packet_number: int = -1  # mpquic用
+    inner_packet_number: int = -1  # for mpquic
 
 
 class Sent_packets(dict):  # Packets already sent.

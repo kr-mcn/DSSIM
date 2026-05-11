@@ -651,7 +651,7 @@ class L4Logger(ParameterClass, TimeManager):
         self.formats: Dict[str, Dict[str, Dict[str, str]]] = {}
         # Names of logs whose averages should be computed ⇒ the average values will be written to files named logname_avg.txt
         self.culc_avg_value_targets: List[str] = [
-            "latest_rtt_change_log", "SF1_latest_rtt_change_log", "SF2_latest_rtt_change_log", "MPQUIC-level_one_way_delay"]
+            "latest_rtt_change_log", "SF1_latest_rtt_change_log", "SF2_latest_rtt_change_log", "MPQUIC-level_one_way_delay", "upf_queuing_delay"]
         self.plot_targets = {
             "send_throughput", "recv_throughput", "goodput",
             "smoothed_RTT", "latest_RTT", "cwnd_size_log", "SF1_cwnd_size_log", "SF2_cwnd_size_log"
@@ -761,7 +761,7 @@ class L4Logger(ParameterClass, TimeManager):
                 f.write(f"{v}\n")
             if footer:
                 for line in footer:
-                    f.write(line)
+                    f.write(f"{line}\n")
 
     def _dump_csv(self, path, data, footer: list[str] = None):
         """
@@ -947,8 +947,8 @@ class L4Logger(ParameterClass, TimeManager):
                             f"average {param} = {avg_rtt:.6f}\t[s]",
                             f"{avg_rtt*1000:.2f} [ms]"
                         ]
-                        self._dump_csv(os.path.join(
-                            subdir, f"{param}.csv"), data, footer)
+                        #self._dump_csv(os.path.join(subdir, f"{param}.csv"), data, footer)
+                        self._dump_txt(os.path.join(subdir, f"{param}.txt"), data, footer)
 
                         continue
 

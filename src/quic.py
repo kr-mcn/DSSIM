@@ -13,6 +13,7 @@ import csv
 import pdb  # pdb.set_trace()
 import shutil
 
+from bbrv1 import BBRv1
 
 class QUIC(ParameterClass, TimeManager):
     def __init__(self, logger):
@@ -29,6 +30,9 @@ class QUIC(ParameterClass, TimeManager):
         if mode == "CUBIC":
             cc_instance = CUBIC_HyStart(
                 logger=self.logger, log_dir1="QUIC", log_dir2=f"UE{ue_id}")
+        elif mode == "BBR":
+            cc_instance = BBRv1(logger=self.logger,
+                              log_dir1="QUIC", log_dir2=f"UE{ue_id}")
         else:
             raise ValueError(f"Unsupported congestion control mode: {mode}")
         self.ue_states[ue_id] = {
@@ -65,6 +69,32 @@ class QUIC(ParameterClass, TimeManager):
             'loss_epoch_end_num': 0,
             'counter_total_packet_loss': 0,
             'counter_total_sent_packets': 0,
+
+            ### BBR attributes added ###
+            'delivered_packets': 0,
+            'packets_in_buffer': True,
+            ### end ###
+
+            # Tunnel RTT (dynamically updated via FB from TECC)
+            'tunnel_rtt': 0.0,
+
+            # Transmission start time per UE
+            'start_time': 0,
+
+            # FCT mode state
+            'fct_flow_size': ParameterClass.FCT_TOTAL_PACKETS if ParameterClass.FCT_MODE else None,
+            'fct_send_complete': False,
+            'fct_send_completion_time': None,
+            'fct_recv_complete': False,
+            'fct_completion_time': None,
+
+            # CAMF: Recommended transmission rate [pkt/ms]. 0.0 = CAMF disabled.
+            # Set from main.py.
+            'camf_target_pps': 0.0,
+            # Fractional carry of leaky bucket.
+            'camf_credit':     0.0,
+            # Currently applied FB ID.
+            'camf_fb_id':      0,
         }
 
     def sender_send(self, ue_id, mpquic_cwnd=None):
@@ -75,18 +105,56 @@ class QUIC(ParameterClass, TimeManager):
 
         # Calculate how many packets can be sent
         if mpquic_cwnd == None:
-            cwnd = state['cc_algo'].cwnd
+            cwnd = state['cc_algo'].cwnd                            ### Note: CCA sets cwnd here!
         else:
-            cwnd = mpquic_cwnd * self.PROPOSED_SOLUTION_FACTOR
+            cwnd = (mpquic_cwnd + state['cc_algo'].cwnd) / 2
         inflight_size = sum(
             1 for packet in state['sent_packets'].values() if packet.in_flight)
-        available_packets = int(cwnd - inflight_size)  # Floor to integer
-        self.logger.store("QUIC", f"UE{ue_id}", f"available_packets_num_log",
-                          f"time_index={TimeManager.time_index}: available_packets = {available_packets}")
+
+        self.logger.store("QUIC", f"UE{ue_id}", "cwnd_inflight_log",
+                          f"t={TimeManager.time_index}, cwnd={int(cwnd)}, inflight={inflight_size}")
+
+        ### BBR limits the pacing window ###
+        if ParameterClass.QUIC_CC == "BBR":
+            pacing_rate = state['cc_algo'].pacing_rate
+            pacing_window = state['cc_algo'].pacing_manager.advance_pacing_manager(pacing_rate)
+            available_packets = max(0, int(cwnd - inflight_size))
+            available_packets = min(int(pacing_window), int(cwnd - inflight_size))
+        ### end ###
+        else:
+            available_packets = max(0, int(cwnd - inflight_size))
+
+        ### CAMF: direct rate synchronization (accumulator) ############################
+        # When camf_target_pps [pkt/ms] is set, synchronize the server transmission rate directly.
+        # Each time_slot adds target_pps to credit; the integer part is the send count for this slot.
+        # The fractional part is carried over to the next slot (leaky bucket).
+        if ParameterClass.CAMF_OPTION and state['camf_target_pps'] > 0.0:
+            state['camf_credit'] += state['camf_target_pps']
+            to_send = int(state['camf_credit'])
+            state['camf_credit'] -= to_send
+            cwnd_headroom = max(0, int(cwnd - inflight_size))
+            if ParameterClass.CAMF_NOCAP_OPTION:
+                available_packets = to_send
+            else:
+                available_packets = min(to_send, cwnd_headroom)
+            self.logger.store("DEBUG", f"UE{ue_id}", "debug", f"time_index={TimeManager.time_index}: smaller={'equal' if to_send == cwnd_headroom else ('to_send' if to_send < cwnd_headroom else 'cwnd_headroom')}")
+        else:
+            # Reset credit when target becomes 0 (to prevent burst on re-activation)
+            state['camf_credit'] = 0.0
+
+        ### end CAMF ################################################################
+
+        #self.logger.store("QUIC", f"UE{ue_id}", f"available_packets_num_log", f"time_index={TimeManager.time_index}: available_packets = {available_packets}")
 
         # If nothing can be sent, return immediately
         if available_packets <= 0:
             return
+        
+        ### For BBR: App limitation condition not possbile in QUIC file ###
+        ### since the packets are generated here and not buffered ###
+        if ParameterClass.APP_LIMITED_OPTION == True:
+            state['packets_in_buffer'] = True
+        ### end ### 
 
         # Update time_of_last_ack_eliciting_packet (last time a data packet was sent)
         state['time_of_last_ack_eliciting_packet'] = round(
@@ -106,6 +174,7 @@ class QUIC(ParameterClass, TimeManager):
             packet[:, self.INDEX_PAYLOAD_SIZE] = self.MTU_BIT_SIZE
             packet[:, self.INDEX_ue_id] = ue_id
             packet[:, self.INDEX_SERVER_TIMESTAMP_ID] = TimeManager.time_index
+            packet[:, self.INDEX_CAMF_FB_ID] = state['camf_fb_id']
             packets_to_send = np.append(packets_to_send, packet, axis=0)
             available_packets -= 1
             self.add_sent_packet(ue_id, packet_number=seq_num, in_flight=True,
@@ -114,11 +183,18 @@ class QUIC(ParameterClass, TimeManager):
 
         # Send new packets if capacity remains
         while available_packets > 0:
+            # FCT mode: stop generating new packets once the specified count is exceeded
+            if ParameterClass.FCT_MODE and state['seq_num'] >= state['fct_flow_size']:
+                state['fct_send_complete'] = True
+                if state['fct_send_completion_time'] is None:
+                    state['fct_send_completion_time'] = TimeManager.time_index
+                break
             packet = np.zeros((1, ParameterClass.NUM_INFO_PACKET), dtype=int)
             packet[:, self.INDEX_PACKET_ID] = state['seq_num']
             packet[:, self.INDEX_PAYLOAD_SIZE] = self.MTU_BIT_SIZE
             packet[:, self.INDEX_ue_id] = ue_id
             packet[:, self.INDEX_SERVER_TIMESTAMP_ID] = TimeManager.time_index
+            packet[:, self.INDEX_CAMF_FB_ID] = state['camf_fb_id']
             packets_to_send = np.append(packets_to_send, packet, axis=0)
             self.add_sent_packet(
                 ue_id, packet_number=state['seq_num'], in_flight=True, sent_bits=self.MTU_BIT_SIZE, retransmission=False)
@@ -138,6 +214,82 @@ class QUIC(ParameterClass, TimeManager):
 
         return packets_to_send
 
+    def sender_send_by_tecc(self, ue_id, mpquic_cwnd=None):
+        state = self.ue_states[ue_id]
+
+        # Calculate how many packets can be sent
+        if mpquic_cwnd:
+            available_packets = int(mpquic_cwnd)
+        else:
+            available_packets = 0
+            
+        # If nothing can be sent, return immediately
+        if available_packets <= 0:
+            return
+        
+        ### For BBR: App limitation condition not possbile in QUIC file ###
+        ### since the packets are generated here and not buffered ###
+        if ParameterClass.APP_LIMITED_OPTION == True:
+            state['packets_in_buffer'] = True
+        ### end ### 
+
+        # Update time_of_last_ack_eliciting_packet (last time a data packet was sent)
+        state['time_of_last_ack_eliciting_packet'] = round(
+            self.time_index * self.TIME_SLOT_WINDOW, 6)
+
+        # Initialize return array
+        packets_to_send = np.zeros(
+            (0, ParameterClass.NUM_INFO_PACKET), dtype=int)
+
+        # Build packets to send
+        # Priority: retransmissions
+        for seq_num in sorted(state['retransmission_seq_nums']):
+            if available_packets <= 0:
+                break
+            packet = np.zeros((1, ParameterClass.NUM_INFO_PACKET), dtype=int)
+            packet[:, self.INDEX_PACKET_ID] = seq_num
+            packet[:, self.INDEX_PAYLOAD_SIZE] = self.MTU_BIT_SIZE
+            packet[:, self.INDEX_ue_id] = ue_id
+            packet[:, self.INDEX_SERVER_TIMESTAMP_ID] = TimeManager.time_index
+            packet[:, self.INDEX_CAMF_FB_ID] = state['camf_fb_id']
+            packets_to_send = np.append(packets_to_send, packet, axis=0)
+            available_packets -= 1
+            self.add_sent_packet(ue_id, packet_number=seq_num, in_flight=True,
+                                 sent_bits=self.MTU_BIT_SIZE, retransmission=True)
+            state['retransmission_seq_nums'].remove(seq_num)
+
+        # Send new packets if capacity remains
+        while available_packets > 0:
+            # # FCT mode: stop generating new packets once the specified count is exceeded
+            if ParameterClass.FCT_MODE and state['seq_num'] >= state['fct_flow_size']:
+                state['fct_send_complete'] = True
+                if state['fct_send_completion_time'] is None:
+                    state['fct_send_completion_time'] = TimeManager.time_index
+                break
+            packet = np.zeros((1, ParameterClass.NUM_INFO_PACKET), dtype=int)
+            packet[:, self.INDEX_PACKET_ID] = state['seq_num']
+            packet[:, self.INDEX_PAYLOAD_SIZE] = self.MTU_BIT_SIZE
+            packet[:, self.INDEX_ue_id] = ue_id
+            packet[:, self.INDEX_SERVER_TIMESTAMP_ID] = TimeManager.time_index
+            packet[:, self.INDEX_CAMF_FB_ID] = state['camf_fb_id']
+            packets_to_send = np.append(packets_to_send, packet, axis=0)
+            self.add_sent_packet(
+                ue_id, packet_number=state['seq_num'], in_flight=True, sent_bits=self.MTU_BIT_SIZE, retransmission=False)
+            state['seq_num'] += 1
+            available_packets -= 1
+
+        # Start timer
+        self.set_loss_detection_timer(ue_id)
+        # Logs transmission throughput and count
+        state['counter_total_sent_packets'] += len(packets_to_send)
+        send_throughput = len(
+            packets_to_send) * ParameterClass.MTU_SIZE * 8 / ParameterClass.TIME_SLOT_WINDOW
+        self.logger.store("QUIC", f"UE{ue_id}",
+                          f"send_throughput", [TimeManager.time_index, send_throughput])
+        self.logger.store("QUIC", f"UE{ue_id}", f"server_send_packet_log",
+                          f"time_index={TimeManager.time_index}: SERVER sent packets = \n{packets_to_send}")
+        return packets_to_send
+
     def receiver(self, ue_id, received_packets):
         """
         Execute receive/send processing on the data receiver (UE for DL).
@@ -150,6 +302,23 @@ class QUIC(ParameterClass, TimeManager):
             if state['ack_counter'] != 0:
                 state['ack_delay'] = round(
                     state['ack_delay'] + self.TIME_SLOT_WINDOW, 6)  # Increase ack_delay
+                # max_ack_delay: force-send ACK if delay exceeds threshold
+                if state['ack_delay'] >= ParameterClass.MAX_ACK_DELAY:
+                    state['ack_counter'] = 0
+                    ack_packet = np.zeros(
+                        (1, ParameterClass.NUM_INFO_PACKET), dtype=int)
+                    ack_size = ParameterClass.IPV4_HEADER_SIZE + \
+                        ParameterClass.UDP_HEADER_SIZE + ParameterClass.ACK_PAYLOAD
+                    ack_packet[:, self.INDEX_PACKET_ID] = state['seq_num_for_ack']
+                    ack_packet[:, self.INDEX_PAYLOAD_SIZE] = ack_size
+                    ack_packet[:, self.INDEX_ue_id] = ue_id
+                    state['ack_packet_dict'][state['seq_num_for_ack']] = [
+                        state['l4_max_received_seq_num']+1, state['missing_seq_nums']]
+                    state['seq_num_for_ack'] += 1
+                    state['ack_delay'] = 0
+                    self.logger.store("QUIC", f"UE{ue_id}", f"ue_send_ack_log",
+                                      f"time_index={TimeManager.time_index}:  UE sent ACK (max_ack_delay) = \n{ack_packet}")
+                    return ack_packet
             return
 
         self.logger.store("QUIC", f"UE{ue_id}", f"ue_received_packet_log",
@@ -225,9 +394,35 @@ class QUIC(ParameterClass, TimeManager):
         self.logger.store("QUIC", f"UE{ue_id}", f"goodput", [
                           TimeManager.time_index, goodput])
 
+        # FCT mode: check that all packets have been received
+        if ParameterClass.FCT_MODE and not state['fct_recv_complete']:
+            if (state['app_max_received_seq_num'] >= state['fct_flow_size'] - 1
+                    and len(state['missing_seq_nums']) == 0):
+                state['fct_recv_complete'] = True
+                state['fct_completion_time'] = TimeManager.time_index
+
         if packets_to_send.size == 0:  # Packets were received but no ACK was generated
             state['ack_delay'] = round(
                 state['ack_delay'] + ParameterClass.TIME_SLOT_WINDOW, 6)
+            # max_ack_delay: force-send ACK if delay exceeds threshold
+            if state['ack_delay'] >= ParameterClass.MAX_ACK_DELAY:
+                state['ack_counter'] = 0
+                ack_packet = np.zeros(
+                    (1, ParameterClass.NUM_INFO_PACKET), dtype=int)
+                ack_size = ParameterClass.IPV4_HEADER_SIZE + \
+                    ParameterClass.UDP_HEADER_SIZE + ParameterClass.ACK_PAYLOAD
+                ack_packet[:, self.INDEX_PACKET_ID] = state['seq_num_for_ack']
+                ack_packet[:, self.INDEX_PAYLOAD_SIZE] = ack_size
+                ack_packet[:, self.INDEX_ue_id] = ue_id
+                state['ack_packet_dict'][state['seq_num_for_ack']] = [
+                    state['l4_max_received_seq_num']+1, state['missing_seq_nums']]
+                state['seq_num_for_ack'] += 1
+                state['ack_delay'] = 0
+                packets_to_send = np.append(
+                    packets_to_send, ack_packet, axis=0)
+                self.logger.store("QUIC", f"UE{ue_id}", f"ue_send_ack_log",
+                                  f"time_index={TimeManager.time_index}:  UE sent ACK (max_ack_delay) = \n{packets_to_send}")
+                return packets_to_send
             return  # Without this, a single returned ACK could be overwritten by an empty packets_to_send
         else:
             state['ack_delay'] = 0
@@ -241,7 +436,20 @@ class QUIC(ParameterClass, TimeManager):
         Execute ACK processing on the server side.
         The argument ack_packets is assumed to consist solely of ACK packets.
         """
+
+        ### BBR cumulative ACK ###
+        cumulative_newly_acked_packets = []
+        cumulative_lost_packets = 0
+        app_limited = False
+        ### end ###
+
         state = self.ue_states[ue_id]
+
+        ### BBR: Snapshot inflight before processing ACKs ###
+        if ParameterClass.QUIC_CC == "BBR":
+            state['cc_algo'].previous_inflight = state['cc_algo'].inflight_packet_data.inflight()
+        ### end ###
+
         if ack_packets.size > 0:
             # Handle one ACK packet at a time
             for ack_packet in ack_packets:
@@ -266,8 +474,10 @@ class QUIC(ParameterClass, TimeManager):
                         continue
 
                     # Check loss epoch end
-                    if state['loss_epoch_flag'] == True and state['loss_epoch_end_num'] in newly_acked_packets:
+                    ### BUGFIX: Check if ANY packet sent AFTER epoch start is ACKed (matches mpquic_subflow.py) ###
+                    if state['loss_epoch_flag'] and any(pn > state['loss_epoch_end_num'] for pn in newly_acked_packets):
                         self.end_loss_epoch(ue_id)
+                    ### end ###
 
                     # Update RTT if the largest ACKed is newly acknowledged
                     if state['largest_acked_packet_on_sender'] in newly_acked_packets:
@@ -289,16 +499,63 @@ class QUIC(ParameterClass, TimeManager):
                     """
 
                     lost_packets = self.detect_and_remove_lost_packets(ue_id)
+
+                    ### BBR initial variable for number of lost packets ###
+                    num_lost_packets = len(lost_packets)
+                    ### end ###
+
                     if lost_packets:
-                        self.on_packets_lost(ue_id, lost_packets)
+                        con_event_present = self.on_packets_lost(ue_id, lost_packets)
+
+                        ### BBR triggers congestion event and transmits number of newely lost packets this ACK ###
+                        if ParameterClass.QUIC_CC == "BBR" and con_event_present:
+                            state['cc_algo'].on_congestion_event()
+                            self.start_loss_epoch(ue_id)
+                        ### end ###
+
+                    ### Code for app limitation was copied from implementation in mpquic_subflow.py and slightly adjusted ###
+                    if ParameterClass.APP_LIMITED_OPTION == True:
+                        inflight_size = len(
+                            [p for p in state['sent_packets'].values() if p.in_flight])
+                        app_limited = (
+                            state['packets_in_buffer'] and inflight_size < state['cc_algo'].cwnd
+                        )
+                    else:
+                        app_limited = False
+                    ### end ###
 
                     # CUBIC control on ACK reception (this layer is always app_limited=False)
                     newly_acked_num = len(newly_acked_packets)
-                    state['cc_algo'].on_ack(segments_num_acked=newly_acked_num, rtt=state['latest_rtt'], smoothed_rtt=state['smoothed_rtt'],
-                                            seq_num_acked=state['largest_acked_packet_on_sender'], next_seq_num=state['seq_num']+1, app_limited=False)
+
+                    ### Note: Calling on_ack() function of CCA ###
+                    ### BBR want all ACKed sequence numbers, not just length ###
+                    if ParameterClass.QUIC_CC == "BBR":
+                        cumulative_newly_acked_packets.extend(newly_acked_packets)
+                        cumulative_lost_packets += num_lost_packets
+                    else:
+                        state['cc_algo'].on_ack(segments_num_acked=newly_acked_num, rtt=state['latest_rtt'], smoothed_rtt=state['smoothed_rtt'],
+                                                seq_num_acked=state['largest_acked_packet_on_sender'], next_seq_num=state['seq_num']+1, app_limited=app_limited)
+                    ### end ###
 
                     state['pto_count'] = 0
                     self.set_loss_detection_timer(ue_id)
+
+        ### Cumulative ACK for BBR - bundeling all ack messages in one sim cycle together ###
+        if ParameterClass.QUIC_CC == "BBR":
+            state['cc_algo'].on_ack(segments_num_acked=cumulative_newly_acked_packets, rtt=state['latest_rtt'], smoothed_rtt=state['smoothed_rtt'],
+                                    seq_num_acked=state['largest_acked_packet_on_sender'], next_seq_num=state['seq_num']+1, app_limited=app_limited, num_lost_packets=cumulative_lost_packets)
+
+            ### BUGFIX: Update delivered counter AFTER on_ack() so delivery rate calculation is correct ###
+            state['delivered_packets'] += len(cumulative_newly_acked_packets)
+            state['cc_algo'].delivered = state['delivered_packets']
+            ### end ###
+        ### end ###
+
+        ### BBR remove packet from internal packet manager after ACK ###
+        if ParameterClass.QUIC_CC == "BBR":
+            for packet_number in cumulative_newly_acked_packets:
+                    state['cc_algo'].inflight_packet_data.delete_packet(packet_number)
+        ### end ###
 
         # Log cwnd size and RTT at the end of the loop
         self.logger.store("QUIC", f"UE{ue_id}",
@@ -345,6 +602,7 @@ class QUIC(ParameterClass, TimeManager):
         return avg_throughput_per_N, avg_total_throughput
 
     def add_sent_packet(self, ue_id, packet_number, in_flight, sent_bits, retransmission):
+        state = self.ue_states[ue_id]
         if ue_id not in self.ue_states:
             raise ValueError(f"UE ID '{ue_id}' has not been initialized.")
         sent_packets = self.ue_states[ue_id]['sent_packets']
@@ -353,10 +611,32 @@ class QUIC(ParameterClass, TimeManager):
         packet.sent_bits = sent_bits
         packet.retransmission = retransmission
 
+        ### BBR add packet to internal packet manager ###
+        state = self.ue_states[ue_id]
+        if ParameterClass.QUIC_CC == "BBR":
+
+            # Get all the important data before
+            bbr_packet_number = packet_number
+            bbr_packet_delivered = state['delivered_packets']
+            bbr_packet_send_time = round(TimeManager.time_index * ParameterClass.TIME_SLOT_WINDOW * 1000, 6) # in ms
+            bbr_packet_size = sent_bits
+            bbr_packet_is_inflight = in_flight
+            bbr_packet_is_app_limited = state['cc_algo'].app_limited
+            bbr_packet_is_retransmitted = retransmission
+
+            # Enter the information into the dict
+            state['cc_algo'].inflight_packet_data.add_packet(bbr_packet_number, bbr_packet_send_time, bbr_packet_delivered, bbr_packet_size,
+                                                            bbr_packet_is_inflight, bbr_packet_is_app_limited, bbr_packet_is_retransmitted, ue_id)
+        ### end ### 
+
     def get_pto_time(self, ue_id):
         state = self.ue_states[ue_id]
         duration = (state['smoothed_rtt'] + max(4 * state['rtt_var'],
                     ParameterClass.K_GRANULARITY)) * (2 ** state['pto_count'])
+        # TECC paper Section 4.2.5: relax PTO by the tunnel RTT amount (dynamic observed value)
+        # CAMF similarly references tunnel_rtt (waiting for MPQUIC retransmission completion)
+        if ParameterClass.TECC_OPTION is True or ParameterClass.CAMF_OPTION is True:
+            duration += state['tunnel_rtt']
 
         has_in_flight_packets = any(
             packet.in_flight for packet in state['sent_packets'].values())
@@ -429,8 +709,14 @@ class QUIC(ParameterClass, TimeManager):
 
         state['loss_time'] = 0
         lost_packets = []
-        loss_delay = self.K_TIME_THRESH * \
-            max(state['latest_rtt'], state['smoothed_rtt'])
+
+        ### BUGFIX: Use RFC 9002 formula (matches mpquic_subflow.py) ###
+        loss_delay = state['smoothed_rtt'] + max(4.0 * state['rtt_var'], 0.005)
+        # TECC paper Section 4.2.5: relax threshold by Tt to suppress spurious losses due to tunnel retransmissions (dynamic observed value)
+        # CAMF similarly references tunnel_rtt (waiting for MPQUIC retransmission completion)
+        if ParameterClass.TECC_OPTION is True or ParameterClass.CAMF_OPTION is True:
+            loss_delay += state['tunnel_rtt']
+        ### end ###
 
         loss_delay = max(loss_delay, self.K_GRANULARITY)
 
@@ -447,10 +733,10 @@ class QUIC(ParameterClass, TimeManager):
                     lost_packets.append(packet_number)
                     self.logger.store(
                         "QUIC", f"UE{ue_id}", f"event_log", f"time_index={TimeManager.time_index}: packet loss (more than 9/8RTT delay)")
-                elif state['largest_acked_packet_on_sender'] >= packet_number + self.K_PACKET_THRESH:
+                elif (state['largest_acked_packet_on_sender'] >= packet_number + self.K_PACKET_THRESH
+                      and not packet.retransmission):
                     lost_packets.append(packet_number)
-                    self.logger.store(
-                        "QUIC", f"UE{ue_id}", f"event_log", f"time_index={TimeManager.time_index}: packet loss (reordering more than 3 packets)")
+                    self.logger.store("QUIC", f"UE{ue_id}", f"event_log", f"time_index={TimeManager.time_index}: packet loss (reordering more than 3 packets)")
                 else:
                     if state['loss_time'] == 0:
                         state['loss_time'] = state['sent_packets'][packet_number].time_sent + loss_delay
@@ -474,6 +760,17 @@ class QUIC(ParameterClass, TimeManager):
 
     def on_loss_detection_timeout(self, ue_id):
         state = self.ue_states[ue_id]
+
+        ### BBR triggeres timeout here ###
+        if ParameterClass.QUIC_CC == "BBR":
+            state['cc_algo'].on_timeout()
+        ### end ###
+
+        ### BBR advances pacing manager because it is not executed in send function in case of on_loss_detection_timeout ###
+        if ParameterClass.QUIC_CC == "BBR":
+            pacing_rate = state['cc_algo'].pacing_rate
+            pacing_window = state['cc_algo'].pacing_manager.advance_pacing_manager(pacing_rate)
+        ### end ###
 
         earliest_loss_time = state['loss_time']
         if earliest_loss_time != 0:  # Non-PTO timer expired
@@ -504,11 +801,18 @@ class QUIC(ParameterClass, TimeManager):
             (0, ParameterClass.NUM_INFO_PACKET), dtype=int)
 
         for _ in range(self.PTO_TRANSMIT_NUM):
+            # FCT mode: check new packet upper limit
+            if ParameterClass.FCT_MODE and state['seq_num'] >= state['fct_flow_size']:
+                state['fct_send_complete'] = True
+                if state['fct_send_completion_time'] is None:
+                    state['fct_send_completion_time'] = TimeManager.time_index
+                break
             packet = np.zeros((1, ParameterClass.NUM_INFO_PACKET), dtype=int)
             packet[:, self.INDEX_PACKET_ID] = state['seq_num']
             packet[:, self.INDEX_PAYLOAD_SIZE] = packet_size
             packet[:, self.INDEX_ue_id] = ue_id
             packet[:, self.INDEX_SERVER_TIMESTAMP_ID] = self.time_index
+            packet[:, self.INDEX_CAMF_FB_ID] = state['camf_fb_id']
             packets_to_send = np.append(packets_to_send, packet, axis=0)
             self.add_sent_packet(
                 ue_id, packet_number=state['seq_num'], in_flight=True, sent_bits=packet_size, retransmission=False)
@@ -543,10 +847,17 @@ class QUIC(ParameterClass, TimeManager):
                 sent_time_of_last_loss, state['sent_packets'][lost_seq_num].time_sent)
             del state['sent_packets'][lost_seq_num]
 
+            ### BBR removes lost packets from internal packet manager ###
+            if ParameterClass.QUIC_CC == "BBR":
+                state['cc_algo'].inflight_packet_data.delete_packet(lost_seq_num)
+            ### end ###
+
         # Trigger a congestion event
-        if sent_time_of_last_loss != 0 and state['loss_epoch_flag'] == False:
-            state['cc_algo'].on_congestion_event()
-            self.start_loss_epoch(ue_id)
+        # Potential bug -> guard for BBR
+        if ParameterClass.QUIC_CC != "BBR":
+            if sent_time_of_last_loss != 0 and state['loss_epoch_flag'] == False:
+                state['cc_algo'].on_congestion_event()
+                self.start_loss_epoch(ue_id)
 
         # If not blocking retransmission for 1 RTT, we could simply extend the list:
         """
@@ -555,9 +866,16 @@ class QUIC(ParameterClass, TimeManager):
 
         # For log.
         self.logger.store("QUIC", f"UE{ue_id}", f"packet_loss_log",
-                          f"time_index={TimeManager.time_index}: Lost packet = {lost_packets}")
+                          f"time_index={TimeManager.time_index}: Newly lost packet = {lost_packets_for_del_from_inflight}")
         state['counter_total_packet_loss'] += len(
             lost_packets_for_del_from_inflight)
+        
+        ### BBR: Return value for congestion event condition ###
+        if sent_time_of_last_loss != 0 and state['loss_epoch_flag'] == False:
+            return True
+        else:
+            return False
+        ### end ###
 
     def start_loss_epoch(self, ue_id):
         state = self.ue_states[ue_id]
@@ -571,6 +889,11 @@ class QUIC(ParameterClass, TimeManager):
         state['loss_epoch_flag'] = False
         self.logger.store("QUIC", f"UE{ue_id}", f"event_log",
                           f"time_index={TimeManager.time_index}: loss_epoch ends.")
+        
+        ### End loss recovery inside of BBR ###
+        if ParameterClass.QUIC_CC == "BBR":
+            state['cc_algo'].exit_congestion_event()
+        ### end ###
 
     def log_for_debug(self, ue_id):
         state = self.ue_states[ue_id]

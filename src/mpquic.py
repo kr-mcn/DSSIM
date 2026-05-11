@@ -13,13 +13,18 @@ from collections import deque
 import shutil
 from logger import L4Logger
 import math
-
+from scheduler import Min_rtt_scheduler
+from bbrv1_definitions import BBRState
 
 class MPQUIC(ParameterClass, TimeManager):
 
     def __init__(self, logger):
         self.ue_states = {}  # Dictionary to manage per-UE states
         self.logger = logger
+
+        # Instantiate the schedular
+        if ParameterClass.SCHEDULER_MODE == "MINRTT":
+            self.schedular = Min_rtt_scheduler()
 
     def initialize_ue(self, ue_id):
         """
@@ -42,6 +47,16 @@ class MPQUIC(ParameterClass, TimeManager):
             'feedback_amount': 0,  # Amount granted by RAN feedback
             'carry_over': 0,  # Amount carried over when pacing cannot send all packets in one slot
             'denominator': 1,  # Denominator used for pacing calculation
+            'retransmit_enqueue_count': 0,  # For TECC r(t): number of packets enqueued in retransmission buffer during FB period
+
+            # ── MPQUIC Flow Control (UPF->UE direction, RFC 9000 compliant) ──────────────────
+            # UE side (receiver): manages cumulative amount passed from send_buffer_to_upper_layer to QUIC layer and MAX_DATA
+            'fc_recv_window':      ParameterClass.MPQUIC_FC_RECV_WINDOW,
+            'fc_recv_offset':      0,     # Cumulative packet count passed to QUIC layer (monotonically increasing)
+            'fc_recv_max_offset':  ParameterClass.MPQUIC_FC_RECV_WINDOW,  # MAX_DATA to advertise
+            # UPF side (sender): manages MAX_DATA received from UE and cumulative sent amount
+            'fc_send_offset':      0,     # Cumulative packets sent as new data (retransmissions not counted)
+            'fc_send_max_offset':  ParameterClass.MPQUIC_FC_RECV_WINDOW,  # MAX_DATA from UE (send limit)
         }
         self.ue_states[ue_id]['subflow_1'].initialize_ue(
             ue_id=ue_id, subflow_id=1)
@@ -61,78 +76,157 @@ class MPQUIC(ParameterClass, TimeManager):
                     start_num, end_num)
                 state['packet_num'] += received_packets.shape[0]
             else:
+                if not ParameterClass.UDP_MODE:
+                    dropped_ids = received_packets[enqueue_limit:, ParameterClass.INDEX_PACKET_ID].tolist()
+                    self.logger.store(
+                        "MPQUIC", f"UE{ue_id}", "upf_buffer_overflow_log",
+                        f"{TimeManager.time_index},{dropped_ids}")
                 end_num = state['packet_num'] + enqueue_limit
                 received_packets[:enqueue_limit, ParameterClass.INDEX_STREAM_PACKET_ID] = np.arange(
                     start_num, end_num)
                 state['packet_num'] += enqueue_limit
 
+            # Stamp UPF enqueue timestamp before buffering
+            received_packets[:, ParameterClass.INDEX_UPF_ENQUEUE_TIMESTAMP] = TimeManager.time_index
+
             # Enqueue packets into the send buffer
             state['send_buffer_to_lower_layer'].enqueue(received_packets)
 
-    def _take_from_buffers(self, state, cap: int):
+    def _take_from_buffers(self, state, cap: int, new_data_cap: int | None = None):
         """
-        Dequeue up to `cap` packets: prioritizing retransmission buffer first, then normal buffer.
-        Return stacked array of packets or None if empty.
+        Dequeue up to `cap` packets: retransmission buffer first, then normal buffer.
+
+        Parameters
+        ----------
+        cap          : total packet cap (from CCA / scheduler)
+        new_data_cap : upper limit on new-data packets only [FC window remaining].
+                       Re-transmissions are NOT subject to this limit.
+                       None means no FC limit (= large window).
+
+        Returns
+        -------
+        tuple (packets, n_new) where
+          packets : stacked ndarray of all packets to send (retransmit + new), or None
+          n_new   : number of new-data packets in `packets` (for fc_send_offset tracking)
         """
         if cap <= 0:
-            return None
+            return None, 0
 
         rbuf = state['retranmission_buffer_to_lower_layer']
         sbuf = state['send_buffer_to_lower_layer']
 
+        # Retransmissions: not subject to FC constraints
         r = rbuf.dequeue(dequeue_type="length", length=cap)
-        rem = cap - len(r)
+        len_r = len(r) if r is not None else 0
+
+        # New data: smaller of CCA remaining capacity and FC window
+        rem = cap - len_r
+        if new_data_cap is not None:
+            rem = min(rem, new_data_cap)
         n = None
         if rem > 0:
             n = sbuf.dequeue(dequeue_type="length", length=rem)
-
-        len_r = len(r) if r is not None else 0
         len_n = len(n) if n is not None else 0
+
         if len_r + len_n == 0:
-            return None
+            return None, 0
         if len_r == 0:
-            return n
+            return n, len_n
         if len_n == 0:
-            return r
-        return np.vstack((r, n))
+            return r, 0
+        return np.vstack((r, n)), len_n
 
-    def _schedule_min_rtt(self, state, ue_id, cap1: int, cap2: int):
+    def _schedule_packets(self, state, ue_id, cap1: int, cap2: int,
+                          new_data_cap: int | None = None):
         """
-        Min-RTT scheduler:
-        Select packets from the subflow with the shorter RTT first, within given caps.
+        Dispatch packets to each subflow according to the configured scheduler.
+        Applies BBR pacing limits first, then invokes the scheduler to decide
+        which subflow gets first access to the shared send buffer.
         If cap is 0, that subflow does not transmit.
-        Return tuple: (sf1_packets, sf2_packets)
-        """
-        if cap1 <= 0 and cap2 <= 0:
-            return None, None
-        if cap1 > 0 and cap2 <= 0:
-            return self._take_from_buffers(state, cap1), None
-        if cap1 <= 0 and cap2 > 0:
-            return None, self._take_from_buffers(state, cap2)
 
+        Parameters
+        ----------
+        new_data_cap : FC remaining window for new data [pkts]. None = no limit.
+
+        Return tuple: (sf1_packets, sf2_packets, n_new_total)
+          n_new_total: number of new-data packets sent across both subflows.
+        """
+
+        # --- BBR pacing limit ---
+        bbr_subflow_1 = None
+        bbr_subflow_2 = None
+        if ParameterClass.MPQUIC_CC == "BBR":
+            bbr_subflow_1 = self.ue_states[ue_id]['subflow_1'].ue_states[ue_id]['cc_algo']
+            pacing_window_1 = bbr_subflow_1.pacing_manager.advance_pacing_manager(
+                bbr_subflow_1.pacing_rate)
+
+            bbr_subflow_2 = self.ue_states[ue_id]['subflow_2'].ue_states[ue_id]['cc_algo']
+            pacing_window_2 = bbr_subflow_2.pacing_manager.advance_pacing_manager(
+                bbr_subflow_2.pacing_rate)
+
+            cap1 = min(cap1, int(pacing_window_1))
+            cap2 = min(cap2, int(pacing_window_2))
+
+        # --- Early returns when one or both paths have no capacity ---
+        if cap1 <= 0 and cap2 <= 0:
+            return None, None, 0
+        if cap1 > 0 and cap2 <= 0:
+            pkts, n_new = self._take_from_buffers(state, cap1, new_data_cap)
+            return pkts, None, n_new
+        if cap1 <= 0 and cap2 > 0:
+            pkts, n_new = self._take_from_buffers(state, cap2, new_data_cap)
+            return None, pkts, n_new
+
+        # --- Both paths have capacity: scheduler decides priority ---
         sf1 = state['subflow_1'].ue_states[ue_id]
         sf2 = state['subflow_2'].ue_states[ue_id]
         rtt1 = sf1['smoothed_rtt']
         rtt2 = sf2['smoothed_rtt']
 
-        if rtt1 <= rtt2:
-            sf1_pkts = self._take_from_buffers(state, cap1)
-            sf2_pkts = self._take_from_buffers(state, cap2)
+        # Min-RTT scheduler
+        if ParameterClass.SCHEDULER_MODE == "MINRTT":
+            first_path_first_flag = self.schedular.schedule(rtt1, rtt2)
+
+        # Consume FC window remaining capacity from the leading path first, then pass the remainder to the following path
+        if first_path_first_flag:
+            sf1_pkts, n_new1 = self._take_from_buffers(state, cap1, new_data_cap)
+            rem_new = (new_data_cap - n_new1) if new_data_cap is not None else None
+            sf2_pkts, n_new2 = self._take_from_buffers(state, cap2, rem_new)
         else:
-            sf2_pkts = self._take_from_buffers(state, cap2)
-            sf1_pkts = self._take_from_buffers(state, cap1)
-        return sf1_pkts, sf2_pkts
+            sf2_pkts, n_new2 = self._take_from_buffers(state, cap2, new_data_cap)
+            rem_new = (new_data_cap - n_new2) if new_data_cap is not None else None
+            sf1_pkts, n_new1 = self._take_from_buffers(state, cap1, rem_new)
+        return sf1_pkts, sf2_pkts, n_new1 + n_new2
 
     def send_data(self, ue_id):
         """
         Get number of transmittable packets for both subflows,
         decide which to send first using min-RTT scheduling,
         and dequeue retransmission packets first.
+        Applies MPQUIC flow control: new-data packets are capped by the remaining
+        FC window (fc_send_max_offset - fc_send_offset). Retransmissions are free.
         """
         state = self.ue_states[ue_id]
         cap1 = state['subflow_1'].ue_states[ue_id]['transmittable_packets_num']
         cap2 = state['subflow_2'].ue_states[ue_id]['transmittable_packets_num']
-        return self._schedule_min_rtt(state, ue_id, cap1, cap2)
+
+        _cwnd1 = state['subflow_1'].ue_states[ue_id]['cc_algo'].cwnd
+        _cwnd2 = state['subflow_2'].ue_states[ue_id]['cc_algo'].cwnd
+        _inflight1 = int(_cwnd1) - cap1
+        _inflight2 = int(_cwnd2) - cap2
+        self.logger.store("MPQUIC", f"UE{ue_id}", "cwnd_inflight_log",
+                          f"t={TimeManager.time_index}, cwnd={int(_cwnd1 + _cwnd2)}, inflight={_inflight1 + _inflight2}")
+
+        # FC: New data send limit = MAX_DATA(UE) - already-sent offset
+        new_data_cap = max(0, state['fc_send_max_offset'] - state['fc_send_offset'])
+
+        sf1_pkts, sf2_pkts, n_new = self._schedule_packets(
+            state, ue_id, cap1, cap2, new_data_cap=new_data_cap)
+
+        # Advance offset only for new data (retransmissions are not counted)
+        state['fc_send_offset'] += n_new
+
+        return sf1_pkts, sf2_pkts
 
     def send_data_considering_ran_fb(self, ue_id, ran_fb_info=None):
         """
@@ -152,10 +246,10 @@ class MPQUIC(ParameterClass, TimeManager):
 
         quota_sf1 = state['6g_path_transmittable']
         cap_sf2 = state['subflow_2'].ue_states[ue_id]['transmittable_packets_num']
-        sf1_packets = self._take_from_buffers(state, quota_sf1)
+        sf1_packets, _ = self._take_from_buffers(state, quota_sf1)
         sent_sf1 = 0 if sf1_packets is None else len(sf1_packets)
         state['6g_path_transmittable'] = max(0, quota_sf1 - sent_sf1)
-        sf2_packets = self._take_from_buffers(state, cap_sf2)
+        sf2_packets, _ = self._take_from_buffers(state, cap_sf2)
         return sf1_packets, sf2_packets
 
     def send_data_considering_both_ran_fb(self, ue_id, ran_fb_sf1=None, ran_fb_sf2=None):
@@ -184,7 +278,7 @@ class MPQUIC(ParameterClass, TimeManager):
             state['5g_path_transmittable'] = max(
                 0, state['5g_path_transmittable'])
 
-        sf1_packets, sf2_packets = self._schedule_min_rtt(
+        sf1_packets, sf2_packets, _ = self._schedule_packets(
             state, ue_id, state['6g_path_transmittable'], state['5g_path_transmittable'])
         sent_length_sf1 = 0 if sf1_packets is None else len(sf1_packets)
         sent_length_sf2 = 0 if sf2_packets is None else len(sf2_packets)
@@ -223,9 +317,9 @@ class MPQUIC(ParameterClass, TimeManager):
         cap_sf2 = state['subflow_2'].ue_states[ue_id]['transmittable_packets_num']
 
         # transmit
-        sf1_packets_to_send = self._take_from_buffers(
+        sf1_packets_to_send, _ = self._take_from_buffers(
             state, quota_sf1)    # cap=quota_sf1
-        sf2_packets_to_send = self._take_from_buffers(
+        sf2_packets_to_send, _ = self._take_from_buffers(
             state, cap_sf2)      # cap=cap_sf2
 
         if sf1_packets_to_send is not None:
@@ -248,8 +342,7 @@ class MPQUIC(ParameterClass, TimeManager):
         self.ue_states[ue_id]['send_buffer_to_upper_layer'].enqueue(packets)
 
     def send_data_to_upper_layer(self, ue_id):
-        packets_to_send = self.ue_states[ue_id]['send_buffer_to_upper_layer'].dequeue(
-        )
+        packets_to_send = self.ue_states[ue_id]['send_buffer_to_upper_layer'].dequeue()
         if packets_to_send is not None and len(packets_to_send) > 0:
             pkts = np.atleast_2d(packets_to_send)
             send_times = pkts[:, ParameterClass.INDEX_UPF_TRANSMIT_TIMESTAMP].astype(
@@ -258,8 +351,14 @@ class MPQUIC(ParameterClass, TimeManager):
             for delay in one_way_delays:
                 self.logger.store(
                     "MPQUIC", f"UE{ue_id}", "MPQUIC-level_one_way_delay", str(int(delay)))
-        self.logger.store("MPQUIC", f"UE{ue_id}", "MPQUIC-level_recv_packets_at_UE",
-                          f"time={TimeManager.time_index}: received packets = {packets_to_send}")
+
+            # FC (UE receiver side): advance receive offset by the amount passed to QUIC layer and update MAX_DATA
+            state = self.ue_states[ue_id]
+            state['fc_recv_offset'] += len(pkts)
+            state['fc_recv_max_offset'] = (state['fc_recv_offset']
+                                           + state['fc_recv_window'])
+
+        #self.logger.store("MPQUIC", f"UE{ue_id}", "MPQUIC-level_recv_packets_at_UE", f"time={TimeManager.time_index}: received packets = {packets_to_send}")
         return packets_to_send
 
     def diff_ack(self, received_acks):

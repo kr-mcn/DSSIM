@@ -124,6 +124,7 @@ def summarize_results(base_dir, num_ue):
     one_way_delay_values_p95 = [None] * num_ue
     one_way_delay_values_p99 = [None] * num_ue
     total_rx_pkts_for_each_UE = []
+    quic_txloss_values = [None] * num_ue  # expected: [tx_num, loss, plr]
 
     for ue_id in range(num_ue):
         output_lines.append(f"UE{ue_id}")
@@ -161,7 +162,16 @@ def summarize_results(base_dir, num_ue):
         one_way_delay_values_p99[ue_id] = float(extract_line_by_number(
             ue_dir / f"MPQUIC-level_one_way_delay_avg.txt", 2).split("\t")[0])
         output_lines.append(
-            f"MPQUIC-level one way delay (UPF-UE) [p95]: \t{one_way_delay_values_p99[ue_id]}")
+            f"MPQUIC-level one way delay (UPF-UE) [p99]: \t{one_way_delay_values_p99[ue_id]}")
+        upf_dir = base_dir / "L4_results" / "UPF" / f"UE{ue_id}"
+        upf_qdelay_avg_path = upf_dir / "upf_queuing_delay_avg.txt"
+        if upf_qdelay_avg_path.exists():
+            upf_qd_avg = extract_line_by_number(upf_qdelay_avg_path, 0).split("\t")[0]
+            upf_qd_p95 = extract_line_by_number(upf_qdelay_avg_path, 1).split("\t")[0]
+            upf_qd_p99 = extract_line_by_number(upf_qdelay_avg_path, 2).split("\t")[0]
+            output_lines.append(f"UPF queuing delay avg: \t{upf_qd_avg}")
+            output_lines.append(f"UPF queuing delay [p95]: \t{upf_qd_p95}")
+            output_lines.append(f"UPF queuing delay [p99]: \t{upf_qd_p99}")
         for sf in ["SF1", "SF2"]:
             output_lines.append(f"<{sf}>")
             send_thpt = extract_single_value(
@@ -220,8 +230,10 @@ def summarize_results(base_dir, num_ue):
             output_lines.append(f"avg_rtt: \t{rtt}")
             output_lines.append(f"avg_rtt [p95]: \t{rtt_p95}")
             output_lines.append(f"avg_rtt [p99]: \t{rtt_p99}")
-            output_lines.extend(get_last_n_lines(
-                ue_dir / f"packet_loss_rate.txt", 3))
+            #output_lines.extend(get_last_n_lines(ue_dir / f"packet_loss_rate.txt", 3))
+            plr_lines = get_last_n_lines(ue_dir / "packet_loss_rate.txt", 3)
+            output_lines.extend(plr_lines)
+            quic_txloss_values[ue_id] = extract_values_from_lines(plr_lines)
             output_lines.append("")
 
     # SECTOR RESULTS
@@ -235,9 +247,22 @@ def summarize_results(base_dir, num_ue):
         output_lines.append("<UE QUIC>")
         output_lines.extend(get_last_n_lines(
             all_ue_dir / "all_UEs_thpt_all_UEs_thpt.txt", 3))
-        # このセクターレベルPLRの部分は未完成。今はおそらくUE9の値を読み込んでいる。
-        output_lines.extend(get_last_n_lines(
-            ue_dir / f"packet_loss_rate.txt", 3))
+        # Sector PLR calculation
+        total_tx = 0.0
+        total_loss = 0.0
+        for row in quic_txloss_values:
+            if not row or len(row) < 2:
+                continue
+            tx, loss = row[0], row[1]
+            if tx is None or loss is None:
+                continue
+            total_tx += tx
+            total_loss += loss
+
+        sector_plr = (total_loss / total_tx) if total_tx > 0 else 0.0
+        output_lines.append(f"Total Sent Packets: \t{total_tx}")
+        output_lines.append(f"Total Packet Losses: \t{total_loss}")
+        output_lines.append(f"PLR: \t{sector_plr}")
         output_lines.append(
             f'Sector RTT [s]: \t{culc_weighted_delay(quic_level_rtt_values, total_rx_pkts_for_each_UE)}\t (Weighted by the num of rx packets for each UE)')
         print(quic_level_rtt_values)
@@ -313,7 +338,7 @@ def summarize_results(base_dir, num_ue):
                          ["txpkts_and_lossnum_values"] if row is not None)
         output_lines.append(f'Total Tx Packets: \t{total_tx_pkts}')
         output_lines.append(f'Total Packet Losses: \t{total_loss}')
-        output_lines.append(f'Packet Loss Rate: \t{total_loss/total_tx_pkts}')
+        output_lines.append(f'Packet Loss Rate: \t{total_loss/total_tx_pkts if total_tx_pkts > 0 else "N/A"}')
 
     output_lines.append("\n<SF1+SF2>")
     output_lines.append(
@@ -328,7 +353,7 @@ def summarize_results(base_dir, num_ue):
             ["txpkts_and_lossnum_values"] if row is not None)
     output_lines.append(f'Total Tx Packets: \t{total_tx_pkts}')
     output_lines.append(f'Total Packet Losses: \t{total_loss}')
-    output_lines.append(f'Packet Loss Rate: \t{total_loss/total_tx_pkts}')
+    output_lines.append(f'Packet Loss Rate: \t{total_loss/total_tx_pkts if total_tx_pkts > 0 else "N/A"}')
 
     output_lines.append("\n<Sector Delay>")
     output_lines.append(
@@ -359,18 +384,15 @@ def summarize_results(base_dir, num_ue):
 def main():
     dir1 = ParameterClass.HEAVY_DATA_PATH
 
-    """
+    
     # Batch Execution
     dir2_list = [
-        "Exp_for_access_UDPfullbuff_3scheme_comparison/20250919-150908_ue=10_slot=30000_D=10_UDP_400M_5G=train5_6G=train5_UDPonCUB",
-        "Exp_for_access_UDPfullbuff_3scheme_comparison/20250919-150917_ue=10_slot=30000_D=10_UDP_400M_5G=train5_6G=train5_UDPonCUB_PROPOSED",
-        "Exp_for_access_UDPfullbuff_3scheme_comparison/20250919-150926_ue=10_slot=30000_D=10_UDP_400M_5G=train5_6G=train5_UDPonCUB_IDEAL",
-        ...
+        "20260503-143042-1_1UE_30.0[s]_N3=10ms_0_10G_N6=10ms_0_50M_btleval_BBRonBBR_MINRTT_TECC=on",
     ]
-    """
+    
     # Latest Directory Execution
-    dir2 = get_latest_directory(dir1)
-    dir2_list = [dir2]
+    #dir2 = get_latest_directory(dir1)
+    #dir2_list = [dir2]
 
     for dir2 in dir2_list:
         pathname = "/summary"

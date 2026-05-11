@@ -392,17 +392,6 @@ class ReorderingBuffer(ParameterClass, TimeManager):
         # timeout prosessing after receiving
         self._detect_timeout()
 
-        # Process to forcefully flush the buffer down to the threshold if it exceeds the threshold
-        if self.length > self.buff_length_thresh:
-            ids = self.content[:self.length, self.INDEX_STREAM_PACKET_ID]
-            sorted_ids = np.sort(ids)
-            index = self.length - self.buff_length_thresh
-            new_expected = sorted_ids[index] + 1
-
-            self.logger.store("MPQUIC", f"UE{self.ue_id}", "RO_buff_event_log",
-                              f"time={TimeManager.time_index}: buffer over threshold ({self.length}). advance expected_packet_id from {self.expected_packet_id} to {new_expected}")
-
-            self.expected_packet_id = new_expected
 
     def dequeue(self):
         """

@@ -4,7 +4,7 @@ import time
 
 
 class WiredLink(ParameterClass, TimeManager):
-    def __init__(self, packet_per_timeslot=10000, bits_per_timeslot=1e6):
+    def __init__(self, bandwidth_pps=10000, bandwidth_bps=100e6, loss_prob=0.0): ### Debug: I think I changed that value ###
         self.volume = 0  # Amount of data currently queued on the link (bits)
         self.length = 0  # Number of packets currently queued on the link
         # Maximum allowed queued data on the link (bits)
@@ -14,9 +14,11 @@ class WiredLink(ParameterClass, TimeManager):
         # Link delay in time slots (unit: time_index)
         self.delay = self.N3_DELAY
         self.packet_per_timeslot = int(
-            packet_per_timeslot
+            bandwidth_pps * ParameterClass.TIME_SLOT_WINDOW
         )  # Max number of packets the link can process per time slot
-        self.bits_per_timeslot = int(bits_per_timeslot)
+        #self.bits_per_timeslot = int(bits_per_timeslot)
+        self.bits_per_timeslot = int(bandwidth_bps * ParameterClass.TIME_SLOT_WINDOW)  # Max number of bits the link can process per time slot
+        self.loss_prob = float(loss_prob)  # Packet loss probability (0.0 = no loss, 0.01 = 1% loss)
         # [packet info fields]
         self.stay_packets = np.zeros(
             [self.max_length, self.NUM_INFO_PACKET], dtype=int)
@@ -91,6 +93,17 @@ class WiredLink(ParameterClass, TimeManager):
         Packets that do not fit the queue are dropped (tail-drop)."""
         if packets is None or len(packets) == 0:
             return 0
+
+        ### PACKET LOSS: Apply random loss if loss_prob > 0 ###
+        if self.loss_prob > 0:
+            # Create boolean mask: True = keep packet, False = drop packet
+            keep_mask = np.random.random(len(packets)) >= self.loss_prob
+            packets = packets[keep_mask]
+
+            # If all packets dropped, return early
+            if len(packets) == 0:
+                return 0
+        ### end ###
 
         length_enqueued_packet = len(packets)
         volume_enqueued_packet = np.sum(packets[:, self.INDEX_PAYLOAD_SIZE])
