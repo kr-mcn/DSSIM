@@ -97,7 +97,7 @@ class ParameterClass:
     # --- Rarely Changed Options ---------------------------
     RAN_FB_OPTION = (  # Feedback mode: receive periodic feedback from 6G RAN about desired transmission volume for next period
         "NONE"   # No feedback
-        # "SINGLE"   # Feedback from a single RAN (e.g., 6G)
+        #"SINGLE"   # Feedback from a single RAN (e.g., 6G)
         #"BOTH"   # Feedback from both 5G/6G RANs
     )
     EXP_THPT_RANGE_SEC = 10 # Time window for measuring experienced throughput [seconds]
@@ -105,12 +105,12 @@ class ParameterClass:
         20  # Feedback cycle period from 6G RAN [unit: time_slot]
     )
     PACING_OPTION = (  # If True: pace out feedback-granted volume gradually instead of sending all at once
-        # True
+        #True
         False
     )
     UDP_MODE = (
-        False  # Use QUIC (reliable transport)
         #True   # Use UDP (unreliable transport)
+        False  # Use QUIC (reliable transport)
     )
     UDP_RATE = 400 * 1e6 # Transmission rate per UE in UDP mode [bps]. 1e6=Mb/s
     APP_LIMITED_OPTION = (
@@ -124,33 +124,31 @@ class ParameterClass:
 
     # --- RAN Configurations ------------------------
     RAN_CONFIG = (
-        "train0", "conf/large_2GHz_10UEs_60000step_25mps_train_0/", "conf/large_5GHz_10UEs_60000step_25mps_train_0/"
-        #"train1", "conf/large_2GHz_10UEs_60000step_25mps_train_1/", "conf/large_5GHz_10UEs_60000step_25mps_train_1/"
-        #"train2", "conf/large_2GHz_10UEs_60000step_25mps_train_2/", "conf/large_5GHz_10UEs_60000step_25mps_train_2/"
-        #"train3", "conf/large_2GHz_10UEs_60000step_25mps_train_3/", "conf/large_5GHz_10UEs_60000step_25mps_train_3/"
-        #"train4", "conf/large_2GHz_10UEs_60000step_25mps_train_4/", "conf/large_5GHz_10UEs_60000step_25mps_train_4/"
-        #"train5", "conf/large_2GHz_10UEs_60000step_25mps_train_5/", "conf/large_5GHz_10UEs_60000step_25mps_train_5/"
-        #"train6", "conf/large_2GHz_10UEs_60000step_25mps_train_6/", "conf/large_5GHz_10UEs_60000step_25mps_train_6/"
-        #"train7", "conf/large_2GHz_10UEs_60000step_25mps_train_7/", "conf/large_5GHz_10UEs_60000step_25mps_train_7/"
-        #"train8", "conf/large_2GHz_10UEs_60000step_25mps_train_8/", "conf/large_5GHz_10UEs_60000step_25mps_train_8/"
-        #"train9", "conf/large_2GHz_10UEs_60000step_25mps_train_9/", "conf/large_5GHz_10UEs_60000step_25mps_train_9/"
-        #"train10", "conf/large_2GHz_10UEs_60000step_25mps_train_10/", "conf/large_5GHz_10UEs_60000step_25mps_train_10/"
-        #"train11", "conf/large_2GHz_10UEs_60000step_25mps_train_11/", "conf/large_5GHz_10UEs_60000step_25mps_train_11/"
-        #"train12", "conf/large_2GHz_10UEs_60000step_25mps_train_12/", "conf/large_5GHz_10UEs_60000step_25mps_train_12/"
-        #"train13", "conf/large_2GHz_10UEs_60000step_25mps_train_13/", "conf/large_5GHz_10UEs_60000step_25mps_train_13/"
-        #"train14", "conf/large_2GHz_10UEs_60000step_25mps_train_14/", "conf/large_5GHz_10UEs_60000step_25mps_train_14/"
-        #"train15", "conf/large_2GHz_10UEs_60000step_25mps_train_15/", "conf/large_5GHz_10UEs_60000step_25mps_train_15/"
-        #"train16", "conf/large_2GHz_10UEs_60000step_25mps_train_16/", "conf/large_5GHz_10UEs_60000step_25mps_train_16/"
-        #"train17", "conf/large_2GHz_10UEs_60000step_25mps_train_17/", "conf/large_5GHz_10UEs_60000step_25mps_train_17/"
-        #"train18", "conf/large_2GHz_10UEs_60000step_25mps_train_18/", "conf/large_5GHz_10UEs_60000step_25mps_train_18/"
-        #"train19", "conf/large_2GHz_10UEs_60000step_25mps_train_19/", "conf/large_5GHz_10UEs_60000step_25mps_train_19/"
+        "trace0", "conf/large_2GHz_10UEs_60000step_25mps_0/", "conf/large_5GHz_10UEs_60000step_25mps_0/"
+        #"trace1", "conf/large_2GHz_10UEs_60000step_25mps_1/", "conf/large_5GHz_10UEs_60000step_25mps_1/"
+        #"trace2", "conf/large_2GHz_10UEs_60000step_25mps_2/", "conf/large_5GHz_10UEs_60000step_25mps_2/"
+        #"trace3", "conf/large_2GHz_10UEs_60000step_25mps_3/", "conf/large_5GHz_10UEs_60000step_25mps_3/"
+        #"trace4", "conf/large_2GHz_10UEs_60000step_25mps_4/", "conf/large_5GHz_10UEs_60000step_25mps_4/"
+        #"trace5", "conf/large_2GHz_10UEs_60000step_25mps_5/", "conf/large_5GHz_10UEs_60000step_25mps_5/"
+        #"trace6", "conf/large_2GHz_10UEs_60000step_25mps_6/", "conf/large_5GHz_10UEs_60000step_25mps_6/"
+        #"trace7", "conf/large_2GHz_10UEs_60000step_25mps_7/", "conf/large_5GHz_10UEs_60000step_25mps_7/"
+        #"trace8", "conf/large_2GHz_10UEs_60000step_25mps_8/", "conf/large_5GHz_10UEs_60000step_25mps_8/"
+        #"trace9", "conf/large_2GHz_10UEs_60000step_25mps_9/", "conf/large_5GHz_10UEs_60000step_25mps_9/"
+        #"trace10", "conf/large_2GHz_10UEs_60000step_25mps_10/", "conf/large_5GHz_10UEs_60000step_25mps_10/"
+        #"trace11", "conf/large_2GHz_10UEs_60000step_25mps_11/", "conf/large_5GHz_10UEs_60000step_25mps_11/"
+        #"trace12", "conf/large_2GHz_10UEs_60000step_25mps_12/", "conf/large_5GHz_10UEs_60000step_25mps_12/"
+        #"trace13", "conf/large_2GHz_10UEs_60000step_25mps_13/", "conf/large_5GHz_10UEs_60000step_25mps_13/"
+        #"trace14", "conf/large_2GHz_10UEs_60000step_25mps_14/", "conf/large_5GHz_10UEs_60000step_25mps_14/"
+        #"trace15", "conf/large_2GHz_10UEs_60000step_25mps_15/", "conf/large_5GHz_10UEs_60000step_25mps_15/"
+        #"trace16", "conf/large_2GHz_10UEs_60000step_25mps_16/", "conf/large_5GHz_10UEs_60000step_25mps_16/"
+        #"trace17", "conf/large_2GHz_10UEs_60000step_25mps_17/", "conf/large_5GHz_10UEs_60000step_25mps_17/"
+        #"trace18", "conf/large_2GHz_10UEs_60000step_25mps_18/", "conf/large_5GHz_10UEs_60000step_25mps_18/"
+        #"trace19", "conf/large_2GHz_10UEs_60000step_25mps_19/", "conf/large_5GHz_10UEs_60000step_25mps_19/"
 
-        # Specific scenario
-        # --- Fixed quality scenario ------------------------
-        # Both RANs fixed (5bps/Hz)
+        # Fixed quality for both RANs (5bps/Hz). For scenarios where the bottleneck section changes.
         #"stable1", "conf/large_2GHz_10UEs_60000step_fix_5/", "conf/large_5GHz_10UEs_60000step_fix_5/"
-        # --- Bottleneck adaptation evaluation scenario ------------------------
-        # Total bandwidth lower bound: 5Mbps, upper bound: 36Mbps
+
+        # Wireless quality varies. However, rate remains above 50 Mbps at all times. This is for the evaluation where the Server-UPF segment is consistently the bottleneck.
         #"btleval", "conf/bottleneck_change_scenario_2GHz/", "conf/bottleneck_change_scenario_5GHz/"
     )
 
